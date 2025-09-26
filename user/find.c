@@ -50,7 +50,7 @@ find(char *path, char *target_name)
         return;
     }
     
-    // 关键修改：无论是文件还是目录，都先检查名称是否匹配
+    // 无论是文件还是目录，都先检查名称是否匹配
     if(strcmp(fmt_name(path), target_name) == 0){
         printf("%s\n", path);
     }

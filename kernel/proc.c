@@ -21,6 +21,7 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[];  // trampoline.S
 
+     
 // initialize the proc table at boot time.
 void procinit(void) {
   struct proc *p;
@@ -271,6 +272,7 @@ int fork(void) {
 // Caller must hold p->lock.
 void reparent(struct proc *p) {
   struct proc *pp;
+  int cnt = 0;
 
   for (pp = proc; pp < &proc[NPROC]; pp++) {
     // this code uses pp->parent without holding pp->lock.
@@ -287,6 +289,8 @@ void reparent(struct proc *p) {
       // the lock on one of init's children (pp). this is why
       // exit() always wakes init (before acquiring any locks).
       release(&pp->lock);
+      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n", p->pid,cnt,pp->pid,pp->name,State2String(pp->state));
+      cnt ++;
     }
   }
 }
@@ -331,6 +335,7 @@ void exit(int status) {
   acquire(&p->lock);
   struct proc *original_parent = p->parent;
   release(&p->lock);
+  exit_info("proc %d exit, parent pid %d, name %s, state %s\n", p->pid,original_parent->pid,original_parent->name,State2String(original_parent->state));
 
   // we need the parent's lock in order to wake it up from wait().
   // the parent-then-child rule says we have to lock it first.
@@ -356,7 +361,7 @@ void exit(int status) {
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
-int wait(uint64 addr) {
+int wait(uint64 addr,int flags) {
   struct proc *np;
   int havekids, pid;
   struct proc *p = myproc();
@@ -396,6 +401,12 @@ int wait(uint64 addr) {
 
     // No point waiting if we don't have any children.
     if (!havekids || p->killed) {
+      release(&p->lock);
+      return -1;
+    }
+    
+    // 非阻塞模式：flags == 1 时直接返回 -1
+    if (flags == 1) {
       release(&p->lock);
       return -1;
     }

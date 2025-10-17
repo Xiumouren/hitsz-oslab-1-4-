@@ -7,6 +7,9 @@
 #include "spinlock.h"
 #include "proc.h"
 
+// 前置声明辅助函数
+static struct proc* find_next_runnable(struct proc *current);
+
 uint64 sys_exit(void) {
   int n;
   if (argint(0, &n) < 0) return -1;
@@ -22,7 +25,7 @@ uint64 sys_wait(void) {
   uint64 p;
   int flags;
   if (argaddr(0, &p) < 0) return -1;
-  if (argint(1, &flags) < 0) return -1;  // 获取 flags 参数
+  if (argint(1, &flags) < 0) return -1;
   return wait(p, flags);
 }
 
@@ -74,7 +77,7 @@ uint64 sys_uptime(void) {
 
 uint64 sys_rename(void) {
   char name[16];
-  int len = argstr(0, name, sizeof(name));
+  int len = argstr(0, name, MAXPATH);
   if (len < 0) {
     return -1;
   }
@@ -85,47 +88,52 @@ uint64 sys_rename(void) {
 }
 
 uint64 sys_yield(void) {
-    struct proc *p = myproc();
-    struct proc *next_proc = 0;
+  struct proc *p = myproc();
+  
+  // 1. 打印内核线程上下文保存的地址范围
+  printf("Save the context of the process to the memory region from address %p to %p\n", 
+         &p->context, (char*)&p->context + sizeof(p->context));
+  
+  // 2. 打印当前进程的pid和用户态pc值
+  printf("Current running process pid is %d and user pc is %p\n", 
+         p->pid, p->trapframe->epc);
+  
+  // 3. 查找下一个RUNNABLE进程并打印信息
+  struct proc *next_proc = find_next_runnable(p);
+  if (next_proc) {
+    printf("Next runnable process pid is %d and user pc is %p\n", 
+           next_proc->pid, next_proc->trapframe->epc);
+    // 记得释放找到的进程的锁，在find_next_runnable中已经释放了
+  } else {
+    printf("Next runnable process not found\n");
+  }
+  
+  // 4. 让出CPU
+  yield();
+  
+  return 0;
+}
+
+// 辅助函数：查找下一个可运行进程
+static struct proc* find_next_runnable(struct proc *current) {
+  struct proc *p;
+  struct proc *found = 0;
+  int start_index = current - proc;
+  int current_index;
+  
+  // 从当前进程的下一个开始环形搜索
+  for (int i = 1; i < NPROC; i++) {
+    current_index = (start_index + i) % NPROC;
+    p = &proc[current_index];
     
-    // 打印当前进程的内核线程上下文保存地址范围
-    // 上下文通常保存在 p->context 中，大小为 sizeof(struct context)
-    uint64 context_start = (uint64)&p->context;
-    uint64 context_end = context_start + sizeof(struct context);
-    printf("Save the context of the process to the memory region from address %p to %p\n", 
-           context_start, context_end);
-    
-    // 打印当前进程的pid和用户态pc值
-    // 用户态pc值保存在trapframe->epc中
-    printf("Current running process pid is %d and user pc is %p\n", 
-           p->pid, p->trapframe->epc);
-    
-    // 寻找下一个可运行的进程
-    acquire(&p->lock); // 保护当前进程
-    
-    for (int i = 0; i < NPROC; i++) {
-        int next_pid = (p->pid + i) % NPROC;
-        if (next_pid == 0) continue; // 跳过pid为0的进程
-        
-        struct proc *np = &proc[next_pid];
-        acquire(&np->lock);
-        
-        if (np->state == RUNNABLE && np != p) {
-            next_proc = np;
-            // 打印下一个进程的信息
-            printf("Next runnable process pid is %d and user pc is %p\n", 
-                   next_proc->pid, next_proc->trapframe->epc);
-            release(&np->lock);
-            break;
-        }
-        
-        release(&np->lock);
+    acquire(&p->lock);
+    if (p->state == RUNNABLE) {
+      found = p;
+      release(&p->lock);
+      break;
     }
-    
     release(&p->lock);
-    
-    // 调用内核的yield函数让出CPU
-    yield();
-    
-    return 0;
+  }
+  
+  return found;
 }

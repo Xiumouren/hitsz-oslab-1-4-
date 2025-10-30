@@ -7,8 +7,6 @@
 #include "spinlock.h"
 #include "proc.h"
 
-// 前置声明辅助函数
-static struct proc* find_next_runnable(struct proc *current);
 
 uint64 sys_exit(void) {
   int n;
@@ -87,53 +85,34 @@ uint64 sys_rename(void) {
   return 0;
 }
 
-uint64 sys_yield(void) {
+uint64
+sys_yield(void)
+{
   struct proc *p = myproc();
-  
-  // 1. 打印内核线程上下文保存的地址范围
-  printf("Save the context of the process to the memory region from address %p to %p\n", 
-         &p->context, (char*)&p->context + sizeof(p->context));
-  
-  // 2. 打印当前进程的pid和用户态pc值
-  printf("Current running process pid is %d and user pc is %p\n", 
-         p->pid, p->trapframe->epc);
-  
-  // 3. 查找下一个RUNNABLE进程并打印信息
-  struct proc *next_proc = find_next_runnable(p);
-  if (next_proc) {
-    printf("Next runnable process pid is %d and user pc is %p\n", 
-           next_proc->pid, next_proc->trapframe->epc);
-    // 记得释放找到的进程的锁，在find_next_runnable中已经释放了
-  } else {
-    printf("Next runnable process not found\n");
-  }
-  
-  // 4. 让出CPU
-  yield();
-  
-  return 0;
-}
+  struct proc *np;
+  int start = (p - proc), i;
 
-// 辅助函数：查找下一个可运行进程
-static struct proc* find_next_runnable(struct proc *current) {
-  struct proc *p;
-  struct proc *found = 0;
-  int start_index = current - proc;
-  int current_index;
-  
-  // 从当前进程的下一个开始环形搜索
-  for (int i = 1; i < NPROC; i++) {
-    current_index = (start_index + i) % NPROC;
-    p = &proc[current_index];
-    
-    acquire(&p->lock);
-    if (p->state == RUNNABLE) {
-      found = p;
-      release(&p->lock);
-      break;
+  exit_info("Save the context of the process to the memory region from address %p to %p\n",
+         &p->context, (char *)&p->context + sizeof(p->context));
+
+  exit_info("Current running process pid is %d and user pc is %p\n",
+         p->pid, p->trapframe->epc);
+
+
+  for (i = 1; i < NPROC; ++i) {
+    np = &proc[(start + i) % NPROC];
+    acquire(&np->lock);
+    if (np->state == RUNNABLE) {
+      exit_info("Next runnable process pid is %d and user pc is %p\n",
+             np->pid, np->trapframe->epc);
+      release(&np->lock);
+      goto done;
     }
-    release(&p->lock);
+    release(&np->lock);
   }
-  
-  return found;
+  printf("Next runnable process not found\n");
+
+done:
+  yield();
+  return 0;
 }

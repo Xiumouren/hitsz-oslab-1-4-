@@ -37,6 +37,7 @@ void procinit(void) {
     uint64 va = KSTACK((int)(p - proc));
     kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
     p->kstack = va;
+    p->kstack_pa = (uint64)pa;
   }
   kvminithart();
 }
@@ -96,7 +97,6 @@ static struct proc *allocproc(void) {
 
 found:
   p->pid = allocpid();
-
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
     release(&p->lock);
@@ -111,11 +111,35 @@ found:
     return 0;
   }
 
+  // create kernel page table
+  p->kernel_pagetable = proc_kpagetable(p);
+  if (p->kernel_pagetable == 0) {
+    freeproc(p);  // freeproc will free kernel_pagetable via proc_freekpagetable()
+    release(&p->lock);
+    return 0;
+  }
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+
+  //内核栈映射到页表k_pagetable里
+  if (mappages(p->kernel_pagetable, p->kstack, PGSIZE, p->kstack_pa, PTE_R | PTE_W) != 0) {
+    freeproc(p);
+    release(&p->lock);
+    printf("ERROR:kernel_pagetable mappages failed\n");
+    printf("p->kstack: %p\n", p->kstack);
+    printf("p->kstack_pa: %p\n", p->kstack_pa);
+    printf("p->kernel_pagetable: %p\n", p->kernel_pagetable);
+    printf("PGSIZE: %d\n", PGSIZE);
+    printf("PTE_R: %d\n", PTE_R);
+    printf("PTE_W: %d\n", PTE_W);
+    printf("PTE_X: %d\n", PTE_X);
+    printf("PTE_U: %d\n", PTE_U);
+    return 0;
+  }
 
   return p;
 }
@@ -128,6 +152,8 @@ static void freeproc(struct proc *p) {
   p->trapframe = 0;
   if (p->pagetable) proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  if (p->kernel_pagetable) proc_freekpagetable(p->kernel_pagetable);
+  p->kernel_pagetable = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -202,6 +228,9 @@ void userinit(void) {
 
   p->state = RUNNABLE;
 
+  // Sync
+  sync_pagetable(p->kernel_pagetable, p->pagetable);
+
   release(&p->lock);
 }
 
@@ -220,6 +249,10 @@ int growproc(int n) {
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
   p->sz = sz;
+
+  // 同步内核页表
+  sync_pagetable(p->kernel_pagetable, p->pagetable);
+
   return 0;
 }
 
@@ -242,6 +275,9 @@ int fork(void) {
     return -1;
   }
   np->sz = p->sz;
+
+  // copy saved user 
+  sync_pagetable(np->kernel_pagetable, np->pagetable);
 
   np->parent = p;
 
@@ -417,6 +453,8 @@ void scheduler(void) {
   struct cpu *c = mycpu();
 
   c->proc = 0;
+  // Ensure we start with the global kernel page table.
+  switch_kpagetable(kernel_pagetable);
   for (;;) {
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
@@ -430,10 +468,17 @@ void scheduler(void) {
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        
+        // 切换到进程的内核页表
+        switch_kpagetable(p->kernel_pagetable);
+        
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
+        // 切换回全局内核页表
+        switch_kpagetable(kernel_pagetable);
+        
         c->proc = 0;
 
         found = 1;
@@ -442,6 +487,8 @@ void scheduler(void) {
     }
 #if !defined(LAB_FS)
     if (found == 0) {
+      // 没有进程运行，切换回全局内核页表
+      switch_kpagetable(kernel_pagetable);
       intr_on();
       asm volatile("wfi");
     }

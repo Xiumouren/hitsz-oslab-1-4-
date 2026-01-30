@@ -6,6 +6,7 @@
 #include "defs.h"
 #include "fs.h"
 
+
 /*
  * the kernel's page table.
  */
@@ -49,6 +50,13 @@ void kvminit() {
 // and enable paging.
 void kvminithart() {
   w_satp(MAKE_SATP(kernel_pagetable));
+  sfence_vma();
+}
+
+// Switch to a process's kernel page table.
+// Used when switching to a process in scheduler().
+void switch_kpagetable(pagetable_t kpagetable) {
+  w_satp(MAKE_SATP(kpagetable));
   sfence_vma();
 }
 
@@ -316,21 +324,17 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
-  uint64 n, va0, pa0;
-
-  while (len > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > len) n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  // Enable supervisor user memory access
+  uint64 old_sstatus = r_sstatus();
+  w_sstatus(old_sstatus | SSTATUS_SUM);
+  
+  // Call the new implementation
+  int result = copyin_new(pagetable, dst, srcva, len);
+  
+  // Restore old sstatus
+  w_sstatus(old_sstatus);
+  
+  return result;
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -338,38 +342,17 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
-  uint64 n, va0, pa0;
-  int got_null = 0;
-
-  while (got_null == 0 && max > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > max) n = max;
-
-    char *p = (char *)(pa0 + (srcva - va0));
-    while (n > 0) {
-      if (*p == '\0') {
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if (got_null) {
-    return 0;
-  } else {
-    return -1;
-  }
+  // Enable supervisor user memory access
+  uint64 old_sstatus = r_sstatus();
+  w_sstatus(old_sstatus | SSTATUS_SUM);
+  
+  // Call the new implementation
+  int result = copyinstr_new(pagetable, dst, srcva, max);
+  
+  // Restore old sstatus
+  w_sstatus(old_sstatus);
+  
+  return result;
 }
 
 // check if use global kpgtbl or not
@@ -379,3 +362,188 @@ int test_pagetable() {
   printf("test_pagetable: %d\n", satp != gsatp);
   return satp != gsatp;
 }
+// 打印页表内容，供调试使用
+static void vmprint_helper(pagetable_t pagetable, int level, uint64 base_va) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if (pte & PTE_V) {
+      // 打印缩进
+      for (int j = 0; j < level; j++) {
+        printf("||   ");
+      }
+      
+      uint64 pa = PTE2PA(pte);
+      uint64 flags = PTE_FLAGS(pte);
+      
+      // 检查是否为非叶子节点（指向下一级页表）
+      if ((pte & (PTE_R|PTE_W|PTE_X)) == 0) {
+        // 非叶子节�?
+        printf("||idx: %d: pa: %p, flags: ----\n", i, pa);
+        // 计算下一级的虚拟地址基址
+        // RISC-V Sv39: level 2->1: shift 30, level 1->0: shift 21
+        int shift = 12 + 9 * (2 - level);
+        uint64 next_base_va = base_va + ((uint64)i << shift);
+        vmprint_helper((pagetable_t)pa, level + 1, next_base_va);
+      } else {
+        // 叶子节点
+        uint64 va = base_va + ((uint64)i << PGSHIFT);
+        char flag_str[5];
+        flag_str[0] = (flags & PTE_R) ? 'r' : '-';
+        flag_str[1] = (flags & PTE_W) ? 'w' : '-';
+        flag_str[2] = (flags & PTE_X) ? 'x' : '-';
+        flag_str[3] = (flags & PTE_U) ? 'u' : '-';
+        flag_str[4] = '\0';
+        printf("||idx: %d: va: %p -> pa: %p, flags: %s\n",
+               i, va, pa, flag_str);
+      }
+    }
+  }
+}
+
+void vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", pagetable);
+  vmprint_helper(pagetable, 0, 0);
+}
+
+// Create a kernel page table for a given process.
+// Returns 0 on failure.
+pagetable_t proc_kpagetable(struct proc *p) {
+  pagetable_t pagetable;
+  
+  pagetable = (pagetable_t)kalloc();
+  if (pagetable == 0) return 0;
+  memset(pagetable, 0, PGSIZE);
+  
+  // uart registers
+  if (mappages(pagetable, UART0, PGSIZE, UART0, PTE_R | PTE_W) != 0) {
+    freewalk(pagetable);
+    return 0;
+  }
+  
+  // virtio mmio disk interface
+  if (mappages(pagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) != 0) {
+    freewalk(pagetable);
+    return 0;
+  }
+  
+  // PLIC
+  if (mappages(pagetable, PLIC, 0x400000, PLIC, PTE_R | PTE_W) != 0) {
+    freewalk(pagetable);
+    return 0;
+  }
+  
+  // map kernel text executable and read-only.
+  if (mappages(pagetable, KERNBASE, (uint64)etext - KERNBASE, KERNBASE, PTE_R | PTE_X) != 0) {
+    freewalk(pagetable);
+    return 0;
+  }
+  
+  // map kernel data and the physical RAM we'll make use of.
+  if (mappages(pagetable, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext, PTE_R | PTE_W) != 0) {
+    freewalk(pagetable);
+    return 0;
+  }
+  
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  if (mappages(pagetable, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) != 0) {
+    freewalk(pagetable);
+    return 0;
+  }
+  
+  return pagetable;
+}
+
+// Recursively free kernel page-table pages.
+// Similar to freewalk, but allows leaf mappings to exist.
+// Only frees the page table pages, not the physical pages they map to.
+static void freewalk_kernel(pagetable_t pagetable) {
+  // there are 2^9 = 512 PTEs in a page table.
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      freewalk_kernel((pagetable_t)child);
+      pagetable[i] = 0;
+    } else if (pte & PTE_V) {
+      // leaf node: just clear the PTE, don't free the physical page
+      pagetable[i] = 0;
+    }
+  }
+  kfree((void *)pagetable);
+}
+
+// Free a process's kernel page table.
+// Only frees the page table pages, not the physical pages they map to.
+// The physical pages (kernel code, data, devices, trampoline, kernel stack)
+// are shared or managed elsewhere.
+void proc_freekpagetable(pagetable_t kpagetable) {
+  if (kpagetable == 0) return;
+
+  /*修复翻译时
+  scause 0x000000000000000d
+  sepc=0x000000008000105e 
+  stval=0x0404040404040000
+  panic: kerneltrap */
+
+  // 获取内核页表的 Level 2 表项（索引0覆盖了用户空间 0x0-0xC0000000）
+  pte_t *pte = &kpagetable[PX(2, 0)];
+  if (*pte & PTE_V) {
+    // 获取 Level 1 页表页
+    pagetable_t level1 = (pagetable_t)PTE2PA(*pte);
+    
+    // 清除前3个表项（对应 sync_pagetable 复制的内容）
+    // 这3个表项指向用户的 L0 页表，它们已经被释放了，不能再访问。
+    for (int i = 0; i < 3; i++) {
+      level1[i] = 0; 
+    }
+  }
+
+  freewalk_kernel(kpagetable);
+}
+
+void sync_pagetable(pagetable_t kpagetable, pagetable_t upagetable) {
+  if (kpagetable == 0 || upagetable == 0) return;
+  
+  //   level 2 (顶层)：每个条目覆盖 512GB
+  //   level 1 (中间层)：每个条目覆盖 1GB  
+  //   level 0 (叶子层)：每个条目覆盖 2MB
+  // 用户空间 0x0-0xC0000000 全部在 level 2 索引 0 中
+  // 我们需要 level 1 的条目 0、1、2（覆盖 3GB）
+
+  // 从用户页表获取 level 2 条目（索引 0）
+  pte_t *upte_l2 = &upagetable[PX(2, 0)];
+  if ((*upte_l2 & PTE_V) == 0) return;
+  
+  // 从用户页表获取 level 1 页表
+  pagetable_t ulevel1 = (pagetable_t)PTE2PA(*upte_l2);
+  
+  // 从内核页表获取或创建 level 2 条目（索引 0）
+  pte_t *kpte_l2 = &kpagetable[PX(2, 0)];
+  pagetable_t klevel1;
+  
+  if ((*kpte_l2 & PTE_V) == 0) {
+    // 为内核页表创建 level 1 页表
+    klevel1 = (pagetable_t)kalloc();
+    if (klevel1 == 0) return;
+    memset(klevel1, 0, PGSIZE);
+    *kpte_l2 = PA2PTE((uint64)klevel1) | PTE_V;
+  } else {
+    // 使用已存在的 level 1 页表
+    klevel1 = (pagetable_t)PTE2PA(*kpte_l2);
+  }
+  
+  // 复制 level 1 条目 0、1、2（覆盖 0x0-0xC0000000）
+  // 只复制有效的条目
+  for (int i = 0; i < 3; i++) {
+    if ((ulevel1[i] & PTE_V) != 0) {
+      klevel1[i] = ulevel1[i];
+    } else {
+      klevel1[i] = 0;  // 清除无效条目
+    }
+  }
+
+  sfence_vma();
+}
+

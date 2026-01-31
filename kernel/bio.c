@@ -23,13 +23,13 @@
 #include "fs.h"
 #include "buf.h"
 
-#define NBUCKETS 13 // 建议使用素数
+#define NBUCKETS 13 
 
 struct {
   struct spinlock lock[NBUCKETS]; // 每个哈希桶一把锁
   struct buf buf[NBUF];           // 实际的 buffer 内存池
   struct buf buckets[NBUCKETS];   // 每个桶的链表头
-  struct spinlock alloc_lock;     // 新增：全局分配锁 (用于序列化分配过程)
+  struct spinlock alloc_lock;     // 全局分配锁 
 } bcache;
 
 // 哈希函数
@@ -43,25 +43,19 @@ binit(void)
   struct buf *b;
   char lockname[16];
 
-  // 1. 初始化全局分配锁
   initlock(&bcache.alloc_lock, "bcache_alloc");
 
-  // 2. 初始化每个桶的锁和链表头
   for(int i = 0; i < NBUCKETS; i++){
     snprintf(lockname, sizeof(lockname), "bcache_%d", i);
     initlock(&bcache.lock[i], lockname);
-    // 建立循环链表
     bcache.buckets[i].next = &bcache.buckets[i];
     bcache.buckets[i].prev = &bcache.buckets[i];
   }
 
-  // 3. 将所有空闲块初始放入 bucket[0] (或者分散放入，这里放入 bucket[0] 简单些)
   for(b = bcache.buf; b < bcache.buf + NBUF; b++){
     b->refcnt = 0;
     b->timestamp = 0;
     initsleeplock(&b->lock, "buffer");
-    
-    // 插入 bucket[0]
     b->next = bcache.buckets[0].next;
     b->prev = &bcache.buckets[0];
     bcache.buckets[0].next->prev = b;
@@ -91,7 +85,7 @@ bget(uint dev, uint blockno)
 
   release(&bcache.lock[id]);
 
-  // 阶段 2: 全局替换/分配流程 (持有 alloc_lock)
+  // 阶段 2: 全局替换(持有 alloc_lock)
 
   acquire(&bcache.alloc_lock);
   acquire(&bcache.lock[id]);
